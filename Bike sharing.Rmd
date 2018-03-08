@@ -1,0 +1,275 @@
+---
+title: "Prediction of bicycle rental use"
+date: "25 November 2017"
+output: html_document
+---
+
+### Problem statment:
+To predict the demand of rental bicycles based on date, time and weather conditions. This will help bicycle rental companies forecast demand so as to strategise and maximise profits.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+```
+
+## Data Pre-processing
+
+```{r}
+library(dplyr)
+hour<- read.csv("hour.csv")
+str(hour)
+
+## Clean   
+hour$hr <-as.factor(hour$hr)
+hour$season<-as.factor(hour$season)
+hour$yr<-as.factor(hour$yr)
+hour$mnth<-as.factor(hour$mnth)
+hour$holiday<-as.factor(hour$holiday)
+hour$workingday<-as.factor(hour$workingday)
+hour$weathersit<-as.factor(hour$weathersit)
+
+# Training sample
+N <- nrow(hour)
+set.seed(123)
+train.index <- sample(1:N, round(4*N/5))
+val.index <- -train.index 
+
+hour.select <- hour %>% dplyr::select(-instant, -dteday, -registered, -casual, -temp, -mnth)
+set.seed(123)
+data.train <- hour.select[train.index, ]
+
+# Model matrix 
+x.train <- model.matrix(cnt ~ ., data = data.train) 
+#head(x.train)
+y.train <- (data.train[,"cnt"])
+#head(y.train)
+
+x.val <- hour.select[val.index,-1]
+y.val <- hour.select[val.index,1]
+
+x.matrix.val <- model.matrix(cnt ~ ., data = hour.select[val.index, ])
+
+```
+
+## Linear Models 
+
+```{r}
+# Linear
+lmod <- lm(cnt ~., data = data.train)
+summary(lmod)
+
+# StepAIC
+library(MASS)
+bestlm <- stepAIC(lmod, direction = "both")
+summary(bestlm)
+
+```
+
+
+## Regularised Linear Model 
+
+```{r}
+# Elasticnet
+# random partition for 10-fold cross-validation
+library("glmnet")
+K <- 10
+n <- nrow(x.train)
+set.seed(123)
+fold <- sample(rep(seq(K), length=n))
+table(fold)
+
+
+# cross-validation to find the best alpha-lambda combination
+alphas <- seq(0, 1, 0.1)
+en2.cv.error <- data.frame(alpha=alphas)
+for (i in 1:length(alphas)){
+    set.seed(123)
+    en2.cv <- cv.glmnet(x.train, y.train, alpha=alphas[i], foldid=fold)
+    en2.cv.error[i, "lambda.1se"] <- en2.cv$lambda.1se
+    en2.cv.error[i, "error.1se"] <- min(en2.cv$cvm) + en2.cv$cvsd[which.min(en2.cv$cvm)]
+}
+en2.cv.error
+
+# optimal lambda and alpha
+#en.lam <- en.cv.error[which.min(en.cv.error$error.min), "lambda.min"]
+#en.alpha <- en.cv.error[which.min(en.cv.error$error.min), "alpha"]
+en2.lam2 <- en2.cv.error[which.min(en2.cv.error$error.1se), "lambda.1se"]
+en2.alpha2 <- en2.cv.error[which.min(en2.cv.error$error.1se), "alpha"]
+
+# plot optimal alpha
+plot(en2.cv.error$alpha, en2.cv.error$error.1se, type="l")
+abline(v=en2.alpha2, lty=2)
+
+# the optimal model
+en2.mod <- glmnet(x.train, y.train, alpha=en2.alpha2)
+plot(en2.mod, xvar="lambda", label = TRUE)
+abline(v=log(en2.lam2), lty=2)
+
+# the coefficients
+en2.MSE <- min(en2.cv.error$error.1se)
+en2.MSE
+predict(en2.mod, type="coefficient", s=en2.lam2, exact=TRUE)
+
+```
+
+## Random Forest
+
+```{r, eval=FALSE}
+# Random Forest optimisation
+library("randomForest")
+
+mse.rfs <- rep(0, 12)
+for(m in 1:12){
+    set.seed(123)
+    rf <- randomForest(cnt ~ ., data=data.train, mtry=m)
+    mse.rfs[m] <- rf$mse[500]
+}
+plot(1:12, mse.rfs, type="b", xlab="mtry", ylab="OOB Error")
+mse.rfs
+
+opt.m <- which.min(mse.rfs)
+rf.MSE <- min(mse.rfs)
+```
+
+```{r, rf}
+# Random forest
+library("randomForest")
+set.seed(123)
+opt.m <-8
+RF <- randomForest(cnt ~ ., data=data.train, mtry=opt.m) 
+#RF
+plot(RF)
+
+importance(RF) 
+varImpPlot(RF)
+
+```
+
+## XGBoost
+
+```{r, eval=FALSE}
+#XGB optimisation
+library("xgboost")
+    
+dtrain <- xgb.DMatrix(data=x.train, label=y.train)
+dtrain
+    
+objective <- "reg:linear"
+cv.fold <- 5
+    
+# parameter ranges
+max_depths <- c(2, 4, 8)  # candidates for d
+etas <- c(0.01, 0.005)  # candidates for lambda
+subsamples <- c(0.5, 0.75, 1)
+colsamples <- c(0.6, 0.8, 1)
+    
+set.seed(123)
+tune.out <- data.frame()
+    for (max_depth in max_depths) {
+        for (eta in etas) {
+            for (subsample in subsamples) {
+                for (colsample in colsamples) {
+                    # **calculate max n.trees by my secret formula**
+                    n.max <- round(100 / (eta * sqrt(max_depth)))
+                    xgb.cv.fit <- xgb.cv(data = dtrain, objective=objective, nfold=cv.fold, early_stopping_rounds=100, verbose=0,
+                                         nrounds=n.max, max_depth=max_depth, eta=eta, subsample=subsample, colsample_bytree=colsample)
+                    n.best <- xgb.cv.fit$best_ntreelimit
+                    if (objective == "reg:linear") {
+                        cv.err <- xgb.cv.fit$evaluation_log$test_rmse_mean[n.best]
+                    } else if (objective == "binary:logistic") {
+                        cv.err <- xgb.cv.fit$evaluation_log$test_error_mean[n.best]
+                    }
+                    out <- data.frame(max_depth=max_depth, eta=eta, subsample=subsample, colsample=colsample, n.max=n.max, nrounds=n.best, cv.err=cv.err)
+                    print(out)
+                    tune.out <- rbind(tune.out, out)
+                }
+            }
+        }
+    }
+    
+tune.out
+cv.err^2
+    
+opt <- which.min(tune.out$cv.err)
+max_depth.opt <- tune.out$max_depth[opt]
+eta.opt <- tune.out$eta[opt]
+subsample.opt <- tune.out$subsample[opt]
+colsample.opt <- tune.out$colsample[opt]
+nrounds.opt <- tune.out$nrounds[opt]
+set.seed(123)
+xgb.opt <- xgboost(data=dtrain, objective="reg:linear", nround=nrounds.opt, max.depth=max_depth.opt, eta=eta.opt, subsample=subsample.opt, colsample_bytree=colsample.opt, verbose = 0)
+    
+n.best <- xgb.cv1$best_ntreelimit
+xgb.MSE <- xgb.cv1$evaluation_log$test_rmse_mean[n.best]^2
+```
+
+```{r, xgb}
+#XGB
+library("xgboost")
+    
+dtrain <- xgb.DMatrix(data=x.train, label=y.train)
+dtrain
+
+max_depth.opt <- 8
+eta.opt <- 0.005
+subsample.opt <- 0.5
+colsample.opt <- 1
+nrounds.opt <- 7071
+
+xgb.opt <- xgboost(data=dtrain, objective="reg:linear", nround=nrounds.opt, max.depth=max_depth.opt, eta=eta.opt, subsample=subsample.opt, colsample_bytree=colsample.opt, verbose = 0)
+
+# variable importance
+importance_matrix <- xgb.importance(model = xgb.opt, feature_names = colnames(x.train))
+importance_matrix
+
+xgb.plot.importance(importance_matrix=importance_matrix, top_n = 8)
+
+# Partial dependence
+library("pdp")
+pd1 <- partial(xgb.opt, train=x.train, pred.var = "atemp", chull = TRUE)
+plotPartial(pd1)
+
+pd2 <- partial(xgb.opt, train=x.train, pred.var = "workingday1", chull = TRUE)
+plotPartial(pd2)
+
+pd3 <- partial(xgb.opt, train=x.train, pred.var = "hr17", chull = TRUE)
+plotPartial(pd3)
+
+pd4 <- partial(xgb.opt, train=x.train, pred.var = "hum", chull = TRUE)
+plotPartial(pd4)
+
+pd5 <- partial(xgb.opt, train=x.train, pred.var = "yr1", chull = TRUE)
+plotPartial(pd5)
+
+## Visualisation
+library(ggplot2)
+hour$hr <- as.factor(hour$hr)
+
+plot <- ggplot(hour, aes(x=hr, y=cnt)) +
+     geom_bar(stat = "identity") +
+     xlab("Hour of the Day") + 
+     ylab("Number of Bike Rentals") 
+
+plot
+
+```
+
+## Model comparison and selection
+
+```{r}
+### Compare Models
+yhat.en2 <- predict(en2.mod, newx=x.matrix.val, s=en2.lam2, type="response")
+yhat.rf <- predict(RF, newx=x.matrix.val, type = "response")
+yhat.xgb <- predict(xgb.opt, newdata = x.matrix.val)
+mse.en2 <- mean((yhat.en2 - y.val)^2)
+mse.rf <- mean((yhat.rf - y.val)^2)
+mse.xgb <- mean((yhat.xgb - y.val)^2)
+
+models.mse <- data.frame(matrix(ncol = 2, nrow = 0))
+models.mse <- rbind(models.mse, data.frame(Model ="Elastic Net", MSE=mse.en2))
+models.mse <- rbind(models.mse, data.frame(Model ="RandomForest", MSE=mse.rf))
+models.mse <- rbind(models.mse, data.frame(Model ="Extreme Gradient Boosting", MSE=mse.xgb))
+models.mse[(order(models.mse$MSE)),]
+```
+
+XGBoost has the lowest MSE and hence is selected as the model of choice.
